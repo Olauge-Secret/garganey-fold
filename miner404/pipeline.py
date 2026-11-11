@@ -69,8 +69,79 @@ REPAIR_OFFSET = 5000
 SELECT_ID = 9000  # plus 10 * (step + 1); the mirrored call takes the next id
 FINAL_SELECT_ID = 9800
 POSE_ID = 9900
-POST_PICK_STEPS = 3  # rewrites of the final pick (steps 7-9: rewrite 700/800/900, selection 9070/9080/9090)
+POST_PICK_STEPS = 0  # r136a: r90a's plan has no post-pick rewrites (r71pd: 3)
 POST_PICK_REWRITE = (SOL, "xhigh")  # the rewrite of the plan's last step
+# r136a: edit rounds after the post-pick rewrites (see Pipeline.edited)
+PATCH_ROUNDS = 3
+PATCH_EFFORT = "xhigh"
+PATCH_MAX_OUTPUT = 24000  # largest edit reply seen at xhigh: 19.2k tokens, almost all reasoning
+PATCH_RESERVE = 20000
+PATCH_FIRST = 10  # r136a: step index of the first round after r90a's ten steps: rewrite id 1100, selection 9110/9111
+PATCH_ASPECT = 0.06  # largest relative change of the outline's width : height in any front view
+EDIT_CALL_KEEP = 240000.0  # credits reserved for an edit call (largest real one: 19.2k output + 19.8k input tokens = 232k)
+TAIL_GATE_KEEP = 45000.0  # credits reserved for a selection call in and after the edit rounds (largest real Sol-medium selection: 41k)
+PATCH_SYSTEM_OLD = "Return only the JavaScript module: no Markdown fences, no explanation."
+PATCH_SYSTEM_NEW = "In this step you do not return the module: you return a few exact edits to the current module, in the format the user message specifies."
+PATCH_TEXT = """Improve the current module by local edits only, so it matches the target more closely. Every visible difference costs points.
+The images above are the target, then the current module close up from the judge's four front cameras in this order:
+30 degrees left, 30 degrees right, from slightly below, from above; the last image is the judge's second-stage grid.
+
+Pick the one to three visible differences that cost the most (a wrong or missing part, a wrong proportion of one part, a wrong
+colour or material, a missing surface detail) and fix only those. Leave every other line untouched: what already matches must
+stay exactly as it is. The object's overall width : height : depth must not change; if a part grows or shrinks, the whole
+outline must stay the same.{note}
+
+Reply format: first the differences you chose (at most 3 short bullets, no code), then one edit block per change, each exactly:
+<<<<<<< SEARCH
+(lines copied character for character from the current module; whole statements; unique in the module; as few as possible)
+=======
+(the replacement lines)
+>>>>>>> REPLACE
+At most 6 blocks. An edit may add helper code by replacing a line with itself plus new lines. Never return the whole module.
+
+Current module:
+{source}"""
+PATCH_NOTE = """
+
+The previous attempt made the changes listed below and the result was judged no better than the current module. Choose other
+differences, or fix the same ones in a clearly different way:
+{summary}"""
+_PATCH_BLOCK = re.compile(r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n>>>>>>> REPLACE", re.S)
+
+
+def apply_edits(raw: str, text: str) -> tuple[str, int]:
+    """The module with every edit block whose SEARCH text occurs exactly once applied in order; the number applied."""
+    applied = 0
+    for old, new in _PATCH_BLOCK.findall(text):
+        if old and raw.count(old) == 1:
+            raw = raw.replace(old, new)
+            applied += 1
+    return raw, applied
+
+
+def outline_aspects(sheet: bytes) -> list[float]:
+    """Width : height of the object's outline in each tile of a FRONT_JUDGE render (0 when a tile is empty)."""
+    aspects = []
+    for tile in judge_tiles(sheet):
+        mask = (np.asarray(Image.open(io.BytesIO(tile)).convert("RGB")) < 250).any(axis=2)
+        ys, xs = np.flatnonzero(mask.any(axis=1)), np.flatnonzero(mask.any(axis=0))
+        aspects.append(float(xs[-1] + 1 - xs[0]) / float(ys[-1] + 1 - ys[0]) if ys.size else 0.0)
+    return aspects
+
+
+def judge_tiles(sheet: bytes) -> list[bytes]:
+    """The four 1024 px tiles of a FRONT_JUDGE render, in S1_VIEWS order (row by row, as the render lays them out)."""
+    image = Image.open(io.BytesIO(sheet)).convert("RGB")
+    width, height = image.width // 2, image.height // 2
+    tiles = []
+    for row in range(2):
+        for column in range(2):
+            buffer = io.BytesIO()
+            image.crop((column * width, row * height, (column + 1) * width, (row + 1) * height)).save(buffer, "PNG")
+            tiles.append(buffer.getvalue())
+    return tiles
+
+
 METAL_PASS = 'const __m404 = new Set(); root.traverse((o) => { const list = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : []; for (const m of list) { if (__m404.has(m)) continue; __m404.add(m); if (m.metalness !== undefined && m.metalness >= 0.25) { m.metalness = 0.8; m.roughness = 0.2; } } });'
 BRIEF_ID = 9990
 BRIEF_MAX_OUTPUT = 4096
@@ -482,6 +553,7 @@ class Candidate:
     match: float = 0.0  # how closely the views match the photo, in measured plans
     measurements: str = ""
     overlay: bytes = b""
+    judge: bytes = b""  # the judge's own front render (2x2, 1024 px tiles), for the edit rounds' proportion guard
 
 
 @dataclass
@@ -548,6 +620,7 @@ class Call:
     max_output_tokens: int
     text: dict[str, Any] | None = None
     estimate: float = 0.0
+    fixed_estimate: float = 0.0  # a measured reservation that replaces the text-length estimate
 
 
 def extract_source(text: str) -> str | None:
@@ -605,7 +678,7 @@ class Pipeline:
         for call in calls:
             text_chars = len(call.instructions) + sum(len(c.get("text", "")) for c in call.content)
             images = sum(1 for c in call.content if c["type"] == "input_image")
-            call.estimate = worst_case(call.model, text_chars, images, call.max_output_tokens)
+            call.estimate = call.fixed_estimate or worst_case(call.model, text_chars, images, call.max_output_tokens)
             admitted.append(call if self.budget.reserve(call.estimate) else None)
         futures = [pool.submit(self._dispatch, call) if call is not None else None for call in admitted]
         return [future.result() if future is not None else None for future in futures]
@@ -741,6 +814,7 @@ class Pipeline:
         except RenderRejected as rejection:
             return source, rejection.detail_json
         candidate = Candidate(name, source, view_sheet(views), grid, raw, views)
+        candidate.judge = front
         if self.photo is not None:
             candidate.match = match.grid_score(front, self.photo)
             candidate.measurements, candidate.overlay = match.feedback(front, self.photo)
@@ -881,7 +955,7 @@ class Pipeline:
                     {"type": "input_image", "image_url": data_url(labels[label].sides), "detail": "high"},
                 ]
             calls.append(Call(request_id + offset, SOL, instructions, content, SELECT_EFFORT, SELECT_MAX_OUTPUT,
-                              text=prompts.select_close_schema(list(labels))))
+                              text=prompts.select_close_schema(list(labels)), fixed_estimate=getattr(self, "tail_gate", 0.0)))
         return self.parse_judgement(labels, self.run_stage(pool, calls))
 
     def select(self, pool: ThreadPoolExecutor, candidates: list[Candidate], parents: set[str], keep: int,
@@ -993,6 +1067,8 @@ class Pipeline:
                     break
                 winner = kept
                 self.best_so_far = winner.source
+            winner = self.edited(pool, winner)  # r134a
+            self.best_so_far = winner.source
             final = self.posed(pool, winner) if plan.pose and not plan.measured else winner
             return self.stronger_metal(self.photo_tilted(self.fitted_last(winner, plan)) if plan.outline_fit_last and final is winner else final.source)
 
@@ -1130,6 +1206,44 @@ class Pipeline:
         judgements = self.scores(pool, [child, winner], SELECT_ID + 10 * (index + 1))
         mine, parent = judgements.get(child.name), judgements.get(winner.name)
         return child if mine is not None and parent is not None and mine.score <= parent.score + PARENT_MARGIN else winner
+
+    def edited(self, pool: ThreadPoolExecutor, winner: Candidate) -> Candidate:
+        """r136a: edit rounds on the final module, from credits left after the post-pick rewrites. Each round asks for
+        SEARCH/REPLACE edits of the costliest differences, applies them, drops a result whose outline proportions moved, and
+        gates the rest against the parent like a post-pick rewrite."""
+        self.tail_gate = TAIL_GATE_KEEP  # from here on (edit rounds, pose stage) selections reserve their measured maximum
+        note = ""
+        for number in range(PATCH_ROUNDS):
+            index = PATCH_FIRST + number
+            call = self.rewrite_call(REWRITE_BASE * (index + 1), SOL, PATCH_EFFORT, winner)
+            call.instructions = call.instructions.replace(PATCH_SYSTEM_OLD, PATCH_SYSTEM_NEW)
+            call.content[-1] = {"type": "input_text", "text": PATCH_TEXT.format(source=winner.raw, note=note)}
+            call.max_output_tokens = PATCH_MAX_OUTPUT
+            call.fixed_estimate = EDIT_CALL_KEEP
+            # this round's two selection calls and the pose stage's two calls stay affordable
+            if not self.budget.allows([EDIT_CALL_KEEP], keep_calls=4, keep_credits=4 * TAIL_GATE_KEEP):
+                break
+            reply = self.run_stage(pool, [call])[0]
+            text = (getattr(reply, "output_text", "") or "") if reply is not None else ""
+            summary = text.split("<<<<<<< SEARCH", 1)[0].strip()[:600]
+            note = PATCH_NOTE.format(summary=summary) if summary else ""
+            raw, applied = apply_edits(winner.raw, text)
+            if not applied:
+                continue
+            child = self.render_module(f"r{index}.0.0", normalize(raw, self.wrapper), raw)
+            if not isinstance(child, Candidate):
+                continue
+            if not winner.judge or not child.judge:  # no judge render to compare outlines with: do not take the edit
+                continue
+            before, after = outline_aspects(winner.judge), outline_aspects(child.judge)
+            if any(a <= 0 or b <= 0 or abs(b / a - 1) > PATCH_ASPECT for a, b in zip(before, after, strict=True)):
+                continue
+            child.parent = winner
+            judgements = self.scores(pool, [child, winner], SELECT_ID + 10 * (index + 1))
+            mine, parent = judgements.get(child.name), judgements.get(winner.name)
+            if mine is not None and parent is not None and mine.score <= parent.score + PARENT_MARGIN:
+                winner, note = child, ""
+        return winner
 
     def posed(self, pool: ThreadPoolExecutor, incumbent: Candidate) -> Candidate:
         """Offer other poses to the selector: the photo-matching quarter turn, and standing a flat object up."""

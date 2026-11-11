@@ -45,6 +45,12 @@ def best_tilt(image: bytes, source: str, render: Callable[[str], bytes]) -> int 
         mask = measure_own.render_mask(np.asarray(rgb).astype(np.float32))
         if mask.sum() <= 20:
             return None
+        if angle == 0:
+            # r139: an object at least as tall as wide in the level front view is standing; tilted, it reads as toppling.
+            # Same modules judged tilted against untilted: 7 wins to 35 for these, 41 to 27 for the wider ones.
+            ys, xs = np.nonzero(mask)
+            if int(ys.max()) - int(ys.min()) >= int(xs.max()) - int(xs.min()):
+                return None
         shown = _square(mask)
         scores[angle] = float((target & shown).sum() / max((target | shown).sum(), 1))
     best = max(TILTS, key=lambda angle: (scores[angle], -angle))
